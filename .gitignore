@@ -1,0 +1,19 @@
+# Node.js 기본 무시 목록
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Puppeteer 크롬 바이너리
+chromium/
+
+# 빌드된 실행 파일
+build/
+
+# 기타 빌드 산출물
+dist/
+out/
+
+# 환경 설정 파일
+.env
+local.settings.json

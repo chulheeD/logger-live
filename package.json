@@ -11,7 +11,7 @@
     "@azure/core-auth": "^1.9.0",
     "@azure/data-tables": "^13.3.0",
     "axios": "^1.8.4",
-    "puppeteer": "^21.3.8"
+    "puppeteer": "^21.11.0"
   },
   "keywords": [],
   "author": "",

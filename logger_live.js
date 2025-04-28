@@ -74,8 +74,8 @@ async function extractErrorContextFromStack(stack) {
         const jsText = await res.text();
         const jsLines = jsText.split("\n");
 
-        const start = Math.max(0, lineNumber - 10);
-        const end = Math.min(jsLines.length, lineNumber + 11);
+        const start = Math.max(0, lineNumber - 30);
+        const end = Math.min(jsLines.length, lineNumber + 30);
 
         const snippetLines = jsLines.slice(start, end).map((l, i) => {
           const realLine = start + i + 1;
@@ -140,6 +140,83 @@ function saveLogs() {
 //const axios = require("axios");
 //const fs = require("fs");
 //const path = require("path");
+
+async function tryAddToCartFromCategory(page) {
+
+  // 카테고리 내 상품 리스트 로딩
+  let productLinks = [];
+
+  const frameHandle = await page.$("iframe#sisFrame");
+
+  if (frameHandle) {
+    try {
+      const frame = await frameHandle.contentFrame();
+      if (!frame) {
+        console.warn("iframe은 존재하지만 아직 attach되지 않았습니다. 일반 페이지로 처리합니다.");
+      } else {
+        await frame.waitForSelector(".o-product a", { timeout: 3000 });
+        productLinks = await frame.$$eval(".o-product a", els => els.map(el => el.href));
+      }
+    } catch (err) {
+      console.error("iframe 접근 중 오류 발생 (frame detached 가능성):", err.message);
+    }
+  }
+
+  if (productLinks.length === 0) {
+    // iframe이 없었거나 frame 접근 실패 → 일반 페이지에서 시도
+    try {
+      await page.waitForSelector(".o-product a", { timeout: 3000 });
+      productLinks = await page.$$eval(".o-product a", els => els.map(el => el.href));
+    } catch (err) {
+      console.error("일반 페이지에서 상품 추출 실패:", err.message);
+    }
+  }
+
+
+  // 랜덤 상품 선택
+  if (productLinks.length === 0) {
+    console.error("상품 리스트 없음");
+    return;
+  }
+
+  const randomLink = productLinks[Math.floor(Math.random() * productLinks.length)].replace("/sis/", "/front/");
+  console.log(`상품 페이지로 이동: ${randomLink}`);
+  await page.goto(randomLink, { waitUntil: "domcontentloaded" });
+
+  
+  const sizeOptions = await page.$$eval(".a-size-swatch .size-options.pdp", (elements) =>
+  elements
+    .filter(el => {
+      const classList = el.className;
+      return (classList.includes("in-stock") || classList.includes("free-size")) && el.offsetParent !== null;
+    })
+    .map(el => {
+      const span = el.querySelector("span");
+      return {
+        slitmCd: el.getAttribute("slitm-cd"),
+        uitmCd: el.getAttribute("uitm-cd"),
+        label: span?.innerText.trim(),
+      };
+    })
+);
+
+if (sizeOptions.length === 0) {
+  await page.goBack(); // 또는 재귀
+  return await tryAddToCartFromCategory(page);
+}
+
+// ▶ 랜덤 사이즈 선택 및 클릭
+const selectedSize = sizeOptions[Math.floor(Math.random() * sizeOptions.length)];
+
+await page.evaluate((label) => {
+  const sizeSpans = Array.from(document.querySelectorAll(".a-size-swatch .size-options.pdp span"));
+  const target = sizeSpans.find(el => el.innerText.trim() === label);
+  if (target) target.click();
+}, selectedSize.label);
+
+await page.waitForSelector("#addBagBtn:not([outofstock='true'])", { timeout: 3000 });
+await page.click("#addBagBtn");
+}
 
 async function analyzeWithAzureAI(logJsonPath) {
   try {
@@ -216,8 +293,6 @@ async function analyzeWithAzureAI(logJsonPath) {
       });
     }
   });
-
-
 
   /*
   pageerror 예시
@@ -365,22 +440,57 @@ async function analyzeWithAzureAI(logJsonPath) {
 
   try {
 
-    await page.goto("https://thehyundai.com/front/dpa/cosHome.thd", { waitUntil: "domcontentloaded" });
+    await page.goto("https://stg.thehyundai.com/front/dpa/cosHome.thd", { waitUntil: "domcontentloaded" });
 
     await page.waitForSelector("a.font_small_s_semibold[href*='cosItemList.thd?sectId=']");
 
     const categoryUrls = await page.
       $$eval("a.font_small_s_semibold[href*='cosItemList.thd?sectId=']", (els) =>
-        els.map((el) => el.href.startsWith("http") ? el.href : `https://www.thehyundai.com${el.getAttribute("href")}`)
+        els.map((el) => el.href.startsWith("http") ? el.href : `https://stg.thehyundai.com${el.getAttribute("href")}`)
       );
+
+    
+    // 검색창 열기
+    await page.waitForSelector("#open-search", { visible: true });
+    await page.click("#open-search");
+
+    // 추천 검색어 href 수집 (숫자로 시작하는 ID 이스케이프)
+    await page.waitForSelector("#\\35 -trend li a");
+    const hrefs = await page.$$eval("#\\35 -trend li a", els => els.map(el => el.getAttribute("href")));
+
+    const baseUrl = "https://stg.thehyundai.com";
+    if (hrefs.length >= 2) {
+      for (let i = 0; i < 2; i++) {
+        const searchUrl = hrefs[i].startsWith("http") ? hrefs[i] : `${baseUrl}${hrefs[i]}`;
+        console.log(`추천 검색어 ${i + 1}로 이동: ${searchUrl}`);
+        await page.goto(searchUrl, { waitUntil: "domcontentloaded" });
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        // 다시 검색창 열기
+        await page.waitForSelector("#open-search", { visible: true });
+        await page.click("#open-search");
+        await page.waitForSelector("#\\35 -trend li a");
+      }
+    }
+
+
+
 
 
     // clothing 카테고리 페이지 전체방문
-    for (const url of categoryUrls) {
+    // clothing 카테고리 페이지 최대 2번만 방문
+    const maxVisits = 2;
+
+    for (let i = 0; i < Math.min(maxVisits, categoryUrls.length); i++) {
+      
+      const url = categoryUrls[i];
       console.log(`이동: ${url}`);
       await page.goto(url, { waitUntil: "domcontentloaded" });
-      await new Promise((resolve) => setTimeout(resolve, 1000)); // 1초 대기
+      await new Promise(resolve => setTimeout(resolve, 1000)); // 1초 대기
     }
+
+    // clothing 카테고리 페이지에서 랜덤 상품 선택
+    await tryAddToCartFromCategory(page);
 
     // 랜덤
     // await page.waitForSelector("a.font_small_s_semibold[href*='cosItemList.thd?sectId=']");
@@ -399,54 +509,8 @@ async function analyzeWithAzureAI(logJsonPath) {
 
 
 
-    let productUrl;
-    const hasIframe = await page.$("iframe#sisFrame");
-
-
-    if (hasIframe) {
-      const frameHandle = await page.$("iframe#sisFrame");
-      const frame = await frameHandle.contentFrame();
-      await frame.waitForSelector(".o-product a");
-      const productLinks = await frame.$$eval(".o-product a", (els) => els.map((el) => el.href));
-      productUrl = productLinks[Math.floor(Math.random() * productLinks.length)];
-    } else {
-      await page.waitForSelector(".o-product a");
-      const productLinks = await page.$$eval(".o-product a", (els) => els.map((el) => el.href));
-      productUrl = productLinks[Math.floor(Math.random() * productLinks.length)];
-    }
-
-
-    productUrl = productUrl.replace("/sis/", "/front/");
-    await page.goto(productUrl, { waitUntil: "domcontentloaded" });
-
-
-    const hasSize = await page.$(".a-size-swatch .size-options.pdp.in-stock") || await page.$(".a-size-swatch .size-options.pdp.free-size");
-    if (!hasSize) throw new Error("사이즈 선택 요소를 찾을 수 없습니다.");
-
-
-    const sizeOptions = await page.$$eval(".a-size-swatch .size-options.pdp", (elements) => {
-      return elements.map((el) => ({
-        slitmCd: el.getAttribute("slitm-cd"),
-        uitmCd: el.getAttribute("uitm-cd"),
-        label: el.innerText.trim(),
-      }));
-    });
-
-
-    if (sizeOptions.length > 0) {
-      const randomSize = sizeOptions[Math.floor(Math.random() * sizeOptions.length)];
-      await page.evaluate((label) => {
-        const all = Array.from(document.querySelectorAll(".a-size-swatch .size-options.pdp span"));
-        const target = all.find(el => el.innerText.trim() === label);
-        if (target) target.click();
-      }, randomSize.label);
-    }
-
-
-    await page.waitForSelector("#addBagBtn:not([outofstock='true'])");
-    await page.click("#addBagBtn");
-
-
+    
+    
     await page.waitForSelector("#nav-bag-desktop");
     await page.click("#nav-bag-desktop");
 
@@ -503,7 +567,7 @@ async function analyzeWithAzureAI(logJsonPath) {
     ]);
 
     // 주문 내역 페이지로 이동
-    await page.goto("https://www.thehyundai.com/front/mpa/selectOrdDlvCrst.thd", { waitUntil: "domcontentloaded" });
+    await page.goto("https://stg.thehyundai.com/front/mpa/selectOrdDlvCrst.thd", { waitUntil: "domcontentloaded" });
     await page.waitForSelector("a.btn.size1.color7");
     const cancelUrls = await page.$$eval("a.btn.size1.color7", els => els.map(el => el.href));
     const latestCancelUrl = cancelUrls[0];
