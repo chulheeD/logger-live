@@ -14,7 +14,7 @@
 *       npm install axios
 * 
 * 실행 방법 
-*       node logger_live.js 
+*       node logger_live.js --brand=cos
 * 동작 설명 
 *    - 더현대닷컴 사이트 접속 후 콘솔 오류/경고 및 request 실패 항목 수집 
 *    - 수집된 로그는 JSON 파일로 저장됨 
@@ -57,7 +57,6 @@ function deduplicateLogs(logs) {
   });
 }
 
-
 async function extractErrorContextFromStack(stack) {
   try {
     const lines = stack.split("\n");
@@ -74,8 +73,8 @@ async function extractErrorContextFromStack(stack) {
         const jsText = await res.text();
         const jsLines = jsText.split("\n");
 
-        const start = Math.max(0, lineNumber - 30);
-        const end = Math.min(jsLines.length, lineNumber + 30);
+        const start = Math.max(0, lineNumber - 40);
+        const end = Math.min(jsLines.length, lineNumber + 40);
 
         const snippetLines = jsLines.slice(start, end).map((l, i) => {
           const realLine = start + i + 1;
@@ -104,15 +103,13 @@ async function extractCodeByLocation(location) {
 
     const jsText = await res.text();
     const lines = jsText.split("\n");
-    console.log("🔥 줄 수:", lines.length);
-    console.log("📍 요청한 line:", lineNumber);
 
     if (lineNumber >= lines.length) {
       return { error: "요청한 줄 번호가 파일 길이를 초과함" };
     }
 
-    const start = Math.max(0, lineNumber - 30);
-    const end = Math.min(lines.length, lineNumber + 30);
+    const start = Math.max(0, lineNumber - 40);
+    const end = Math.min(lines.length, lineNumber + 40);
 
     const snippet = lines.slice(start, end).map((line, i) => {
       const realLine = start + i + 1;
@@ -122,7 +119,7 @@ async function extractCodeByLocation(location) {
 
     return snippet;
   } catch (err) {
-    return `❌ 코드 추출 실패: ${err.message}`;
+    return `코드 추출 실패: ${err.message}`;
   }
 }
 
@@ -137,11 +134,221 @@ function saveLogs() {
   return filename;
 }
 
-//const axios = require("axios");
-//const fs = require("fs");
-//const path = require("path");
+function setupLogHandlers(page) {
+  /*
+  console 예시
+  Uncaught TypeError: Cannot read properties of null (reading 'classList')
+    at new MobileMenu (cos.custom.js?ver=040715:371:61)
+    at window.onload (cos.custom.js?ver=040715:434:10)
+  */
+    page.on("console", async (msg) => {
+      console.log("전체 콘솔 객체:", msg);
+      console.log("msg.text():", msg.text());
+      console.log("msg.location():", msg.location());
+      console.log("msg.type():", msg.type());
+  
+      const logType = msg.type();
+      const message = msg.text().toLowerCase();
+  
+      if (logType === "error" || (logType === "warning" && message.includes("deprecated"))) {
+        const location = msg.location();
+        let codeSnippet = null;
+  
+        if (location?.url && typeof location.lineNumber === "number") {
+          codeSnippet = await extractCodeByLocation(location);
+          console.log("codeSnippet:", codeSnippet);
+        } else {
+          const fallback = await extractErrorContextFromStack(msg.text());
+          codeSnippet = fallback?.snippet;
+          console.log("codeSnippet:", codeSnippet);
+        }
+  
+  
+  
+        logCollector.push({
+          type: `console-${logType}`,
+          message: msg.text(),
+          timestamp: new Date().toISOString(),
+          url: page.url(),
+          ...(codeSnippet && { codeSnippet })
+        });
+      }
+    });
+  
+    /*
+    pageerror 예시
+    Uncaught TypeError: Cannot read properties of null (reading 'classList')
+      at new MobileMenu (https://image.thehyundai.com/pc/js/cos/cos.custom.js?ver=040715:371:61)
+      at window.onload (https://image.thehyundai.com/pc/js/cos/cos.custom.js?ver=040715:434:10)
+    */
+    page.on("pageerror", async (err) => {
+      const message = err.message.toLowerCase();
+    
+      // 심각한 에러가 아닌 경우 무시 (선택)
+      //sif (!message.includes("uncaught") && !message.includes("is not defined")) return;
+    
+      console.log("PAGE ERROR STACK:\n", err.stack);
+    
+      // 🔍 스택에서 코드 위치 기반 코드 스니펫 추출
+      const context = await extractErrorContextFromStack(err.stack);
+    
+      const logData = {
+        type: "pageerror",
+        message: err.message,
+        timestamp: new Date().toISOString(),
+        pageUrl: page.url(),
+      };
+    
+      // context.snippet이 있으면 포함
+      if (context?.snippet) {
+        logData.codeSnippet = context.snippet;
+        logData.codeUrl = context.url;
+        logData.codeLine = context.line;
+      } else if (context?.error) {
+        logData.codeSnippet = context.error;
+      }
+    
+      // (선택) 스크린샷 캡처 비활성화 상태 유지
+      /*
+      const timestamp = Date.now();
+      const screenshotPath = `pageerror-screenshot-${timestamp}.png`;
+      await page.setViewport({ width: 1280, height: 720 });
+      await page.waitForSelector("body", { visible: true });
+      await page.screenshot({ path: screenshotPath });
+      logData.screenshot = screenshotPath;
+      */
+    
+      logCollector.push(logData);
+    });
+  
+    
+  
+    page.on("requestfailed", async (req) => {
+    try {
+      const failedUrl = req.url();
+      const hostname = new URL(failedUrl).hostname;
+      const excludedDomains = [
+        "analytics.google.com",
+        "www.google-analytics.com",
+        "cm.g.doubleclick.net"
+      ];
+  
+      if (excludedDomains.includes(hostname)) return;
+  
+      const timestamp = new Date().toISOString();
+  
+      // (옵션) 스크린샷
+      /*
+      const screenshotPath = `requestfail-screenshot-${Date.now()}.png`;
+      await page.setViewport({ width: 1280, height: 720 });
+      await page.waitForSelector("body", { visible: true });
+      await page.screenshot({ path: screenshotPath });
+      */
+  
+      logCollector.push({
+        type: "request-failed",
+        message: req.failure()?.errorText || "Unknown failure",
+        url: failedUrl,
+        timestamp,
+        pageUrl: page.url(),
+        // screenshot: screenshotPath
+      });
+    } catch (e) {
+      logCollector.push({
+        type: "request-failed",
+        message: req.failure()?.errorText || "Unknown failure",
+        url: req.url(),
+        timestamp: new Date().toISOString(),
+        pageUrl: page.url(),
+        note: "URL 파싱 실패, 필터 예외 처리됨"
+        // screenshot: screenshotPath
+      });
+    }
+  });
+  
+    // page.on("console", (msg) => {
+    //   const logType = msg.type(); // 'log', 'warning', 'error', 등
+    //   const message = msg.text().toLowerCase(); // 소문자로 변환해서 비교
+    //   if (
+    //     logType === "error" ||
+    //     (logType === "warning" && message.includes("deprecated"))
+    //   ) {
+    //     logCollector.push({
+    //       type: `console-${logType}`,
+    //       message: msg.text(),
+    //       timestamp: new Date().toISOString(),
+    //       url: page.url(),
+    //     });
+    //   }
+    // });
+  
+  
+    // page.on("pageerror", (err) =>
+    //   logCollector.push({
+    //     type: "pageerror",
+    //     message: err.message,
+    //     timestamp: new Date().toISOString(),
+    //     url: page.url(),
+    //   })
+    // );
+    // page.on("requestfailed", (req) => {
+    //   try {
+    //     const failedUrl = req.url();
+    //     const hostname = new URL(failedUrl).hostname;
+    //     const excludedDomains = ["analytics.google.com", "www.google-analytics.com"];
+    //     if (!excludedDomains.includes(hostname)) {
+    //       logCollector.push({
+    //         type: "request-failed",
+    //         message: req.failure().errorText,
+    //         url: failedUrl,
+    //         timestamp: new Date().toISOString(),
+    //         pageUrl: page.url(),
+    //       });
+    //     }
+    //   } catch (e) {
+    //     // URL 파싱 실패시에도 안전하게 로그 수집 (optional fallback)
+    //     logCollector.push({
+    //       type: "request-failed",
+    //       message: req.failure().errorText,
+    //       url: req.url(),
+    //       timestamp: new Date().toISOString(),
+    //       pageUrl: page.url(),
+    //       note: "URL 파싱 실패, 필터 예외 처리됨",
+    //     });
+    //   }
+    // });
+}
 
-async function tryAddToCartFromCategory(page) {
+async function analyzeWithAzureAI(logJsonPath) {
+  try {
+    const logContent = fs.readFileSync(logJsonPath, "utf-8");
+    const logs = JSON.parse(logContent);
+
+    const response = await axios.post(
+      "https://console-log-project.azurewebsites.net/api/logger_analyze?code=mkU_yDYMysX6KEmMe0kDzJaj-pn8YhhpctzGNp9Co4ivAzFuvSllxw==",
+      {
+        logs: logs,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+        timeout: 30000 // (선택) 30초 타임아웃
+      }
+    );
+
+    const summary = response.data?.summary || "분석 결과 없음";
+    const resultFilename = `analysis-result-${Date.now()}.txt`;
+    const resultPath = path.join(path.dirname(logJsonPath), resultFilename);
+
+    fs.writeFileSync(resultPath, summary);
+    console.log(`분석 결과 저장 완료: ${resultPath}`);
+  } catch (err) {
+    console.error("Function App 호출 실패:", err.response?.data || err.message);
+  }
+} 
+
+async function tryAddToCartFromCosCategory(page) {
 
   // 카테고리 내 상품 리스트 로딩
   let productLinks = [];
@@ -198,54 +405,211 @@ async function tryAddToCartFromCategory(page) {
         label: span?.innerText.trim(),
       };
     })
-);
-
-if (sizeOptions.length === 0) {
-  await page.goBack(); // 또는 재귀
-  return await tryAddToCartFromCategory(page);
+  );
+  if (sizeOptions.length === 0) {
+    await page.goBack(); // 또는 재귀
+    return await tryAddToCartFromCosCategory(page);
+  }
+  
+  // ▶ 랜덤 사이즈 선택 및 클릭
+  const selectedSize = sizeOptions[Math.floor(Math.random() * sizeOptions.length)];
+  
+  await page.evaluate((label) => {
+    const sizeSpans = Array.from(document.querySelectorAll(".a-size-swatch .size-options.pdp span"));
+    const target = sizeSpans.find(el => el.innerText.trim() === label);
+    if (target) target.click();
+  }, selectedSize.label);
+  
+  await page.waitForSelector("#addBagBtn:not([outofstock='true'])", { timeout: 3000 });
+  await page.click("#addBagBtn");
 }
 
-// ▶ 랜덤 사이즈 선택 및 클릭
-const selectedSize = sizeOptions[Math.floor(Math.random() * sizeOptions.length)];
+// --- 브랜드별 테스트 실행 함수 ---
+async function runCosTest(page, browser) {
+  console.log("COS 사이트 테스트 시작");
 
-await page.evaluate((label) => {
-  const sizeSpans = Array.from(document.querySelectorAll(".a-size-swatch .size-options.pdp span"));
-  const target = sizeSpans.find(el => el.innerText.trim() === label);
-  if (target) target.click();
-}, selectedSize.label);
+  await page.goto("https://www.thehyundai.com/front/dpa/cosHome.thd", { waitUntil: "domcontentloaded" });
 
-await page.waitForSelector("#addBagBtn:not([outofstock='true'])", { timeout: 3000 });
-await page.click("#addBagBtn");
-}
+  await page.waitForSelector("a.font_small_s_semibold[href*='cosItemList.thd?sectId=']");
 
-async function analyzeWithAzureAI(logJsonPath) {
-  try {
-    const logContent = fs.readFileSync(logJsonPath, "utf-8");
-    const logs = JSON.parse(logContent);
-
-    const response = await axios.post(
-      "https://console-log-project.azurewebsites.net/api/logger_analyze?code=mkU_yDYMysX6KEmMe0kDzJaj-pn8YhhpctzGNp9Co4ivAzFuvSllxw==",
-      {
-        logs: logs,
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-        timeout: 30000 // (선택) 30초 타임아웃
-      }
+  const categoryUrls = await page.
+    $$eval("a.font_small_s_semibold[href*='cosItemList.thd?sectId=']", (els) =>
+      els.map((el) => el.href.startsWith("http") ? el.href : `https://www.thehyundai.com${el.getAttribute("href")}`)
     );
 
-    const summary = response.data?.summary || "분석 결과 없음";
-    const resultFilename = `analysis-result-${Date.now()}.txt`;
-    const resultPath = path.join(path.dirname(logJsonPath), resultFilename);
+  
+  // 검색창 열기
+  await page.waitForSelector("#open-search", { visible: true });
+  await page.click("#open-search");
 
-    fs.writeFileSync(resultPath, summary);
-    console.log(`✅ 분석 결과 저장 완료: ${resultPath}`);
-  } catch (err) {
-    console.error("❌ Function App 호출 실패:", err.response?.data || err.message);
+  // 추천 검색어 href 수집 (숫자로 시작하는 ID 이스케이프)
+  await page.waitForSelector("#\\35 -trend li a");
+  const hrefs = await page.$$eval("#\\35 -trend li a", els => els.map(el => el.getAttribute("href")));
+
+  const baseUrl = "https://www.thehyundai.com";
+  if (hrefs.length >= 2) {
+    for (let i = 0; i < 2; i++) {
+      const searchUrl = hrefs[i].startsWith("http") ? hrefs[i] : `${baseUrl}${hrefs[i]}`;
+      console.log(`추천 검색어 ${i + 1}로 이동: ${searchUrl}`);
+      await page.goto(searchUrl, { waitUntil: "domcontentloaded" });
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // 다시 검색창 열기
+      await page.waitForSelector("#open-search", { visible: true });
+      await page.click("#open-search");
+      await page.waitForSelector("#\\35 -trend li a");
+    }
   }
-} 
+
+  // clothing 카테고리 페이지 전체방문
+  // clothing 카테고리 페이지 최대 2번만 방문
+  const maxVisits = 2;
+
+  for (let i = 0; i < Math.min(maxVisits, categoryUrls.length); i++) {
+    
+    const url = categoryUrls[i];
+    console.log(`이동: ${url}`);
+    await page.goto(url, { waitUntil: "domcontentloaded" });
+    await new Promise(resolve => setTimeout(resolve, 1000)); // 1초 대기
+  }
+
+  // clothing 카테고리 페이지에서 랜덤 상품 선택
+  await tryAddToCartFromCosCategory(page);
+
+  // 랜덤
+  // await page.waitForSelector("a.font_small_s_semibold[href*='cosItemList.thd?sectId=']");
+  // const clothingCategoryUrl = await page.$$eval("a.font_small_s_semibold[href*='cosItemList.thd?sectId=']", (els) => {
+  //   const hrefs = els.map((el) => el.href.startsWith("http") ? el.href : `https://www.thehyundai.com${el.getAttribute("href")}`);
+  //   return hrefs[Math.floor(Math.random() * hrefs.length)];
+  // });
+  // // await page.goto(clothingCategoryUrl, { waitUntil: "domcontentloaded" });
+
+
+  // for (const url of categoryUrls) {
+  //   console.log(`이동: ${url}`);
+  //   await page.goto(url, { waitUntil: "domcontentloaded" });
+  //   await new Promise((resolve) => setTimeout(resolve, 1000)); //대기
+  // }
+
+
+
+  
+  
+  await page.waitForSelector("#nav-bag-desktop");
+  await page.click("#nav-bag-desktop");
+
+
+  await page.waitForSelector(".btn-wrap a.btn");
+  await page.click(".btn-wrap a.btn");
+
+
+  // 로그인 팝업 제어
+  const pagesAfterPopup = await browser.pages();
+  const loginPage = pagesAfterPopup.find(p => p !== page);
+  if (!loginPage) throw new Error("로그인 팝업을 찾을 수 없습니다.");
+  await loginPage.bringToFront();
+
+
+  await loginPage.waitForSelector("#btn-go-thdLogin", { visible: true });
+  await loginPage.evaluate(() => document.getElementById("btn-go-thdLogin").click());
+  // 더현대닷컴 계정 입력
+  await loginPage.type("input[name='id']", "1234@gmail.com");
+  await loginPage.type("input[name='pwd']", "1234");
+  await loginPage.evaluate(() => memberLogin());
+  await new Promise(r => setTimeout(r, 5000));  // 로그인 대기
+
+
+  await page.bringToFront(); // 기존 주문 페이지로 복귀
+  await page.reload({ waitUntil: "domcontentloaded" });  // 로그인 상태 반영
+
+
+  await page.waitForSelector("#restPayRadio", { visible: true, timeout: 10000 });
+  await page.evaluate(() => {
+    document.querySelector("#restPayRadio").scrollIntoView({ behavior: "instant", block: "center" });
+  });
+
+
+  await page.click("#restPayRadio");
+
+
+  // 무통장입금 선택이 이미 되어 있다면 클릭 생략
+  const isCashChecked = await page.$eval("input[name='pay-depth1'][value='cash']", el => el.checked);
+  if (!isCashChecked) {
+    await page.click("input[name='pay-depth1'][value='cash']");
+  }
+
+
+  await page.waitForSelector("#ordAgreeChk");
+  await page.click("#ordAgreeChk");
+
+
+  await Promise.all([
+    page.waitForNavigation({ timeout: 60000, waitUntil: "networkidle2" }),
+    page.evaluate(() => {
+      const orderBtn = document.querySelector("a.btn.color2.size7");
+      if (orderBtn) orderBtn.click();  // onclick="order(this)" 트리거됨
+    }),
+  ]);
+
+  // 주문 내역 페이지로 이동
+  await page.goto("https://www.thehyundai.com/front/mpa/selectOrdDlvCrst.thd", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("a.btn.size1.color7");
+  const cancelUrls = await page.$$eval("a.btn.size1.color7", els => els.map(el => el.href));
+  const latestCancelUrl = cancelUrls[0];
+
+
+  await page.goto(latestCancelUrl, { waitUntil: "domcontentloaded" });
+
+
+  // 수량 저장 클릭
+  await page.waitForFunction(() => typeof fnOrdCnclQtyChg === 'function');
+  await page.evaluate(() => fnOrdCnclQtyChg());
+
+
+  // 단순변심 선택
+  await page.select("select[name='cnslInqr']", "010105");
+
+
+  // 주문취소 버튼 클릭 전 팝업 처리
+  page.on("dialog", async (dialog) => {
+    console.log("알림 팝업 확인:", dialog.message());
+    await dialog.accept();
+  });
+
+
+  // 주문취소 버튼 클릭
+  await page.click("#btnOrdCnclReq");
+
+
+  // 로그아웃 수행
+  //await page.goto("https://www.thehyundai.com/front/member/logout.thd", { waitUntil: "domcontentloaded" });
+  const savedLog = saveLogs();
+  //await analyzeWithAzureAI(savedLog);
+  
+
+  await browser.close();
+}
+
+async function runArketTest(page, browser) {
+  console.log("아르켓 사이트 테스트 시작");
+}
+
+async function runThehyundaiTest(page, browser) {
+  console.log("더현대닷컴 사이트 테스트 시작");
+}
+
+async function runOtherstoriesTest(page, browser) {
+  console.log("앤아더스토리즈 사이트 테스트 시작");
+}
+
+async function runTotemeTest(page, browser) {
+  console.log("토템 사이트 테스트 시작");
+}
+
+async function runNanushkaTest(page, browser) {
+  console.log("나누쉬카 사이트 테스트 시작");
+}
+
 (async () => {
   const browser = await puppeteer.launch({
     headless: false,
@@ -254,360 +618,48 @@ async function analyzeWithAzureAI(logJsonPath) {
   });
   const page = (await browser.pages())[0];
 
-  /*
-  console 예시
-  Uncaught TypeError: Cannot read properties of null (reading 'classList')
-    at new MobileMenu (cos.custom.js?ver=040715:371:61)
-    at window.onload (cos.custom.js?ver=040715:434:10)
-  */
-  page.on("console", async (msg) => {
-    console.log("📦 전체 콘솔 객체:", msg);
-    console.log("📜 msg.text():", msg.text());
-    console.log("🔍 msg.location():", msg.location());
-    console.log("🧩 msg.type():", msg.type());
+  setupLogHandlers(page);
 
-    const logType = msg.type();
-    const message = msg.text().toLowerCase();
+  const args = process.argv.slice(2);
+  const brandArg = args.find(arg => arg.startsWith("--brand="));
+  const brand = brandArg ? brandArg.split("=")[1] : null;
 
-    if (logType === "error" || (logType === "warning" && message.includes("deprecated"))) {
-      const location = msg.location();
-      let codeSnippet = null;
-
-      if (location?.url && typeof location.lineNumber === "number") {
-        codeSnippet = await extractCodeByLocation(location);
-        console.log("🧩🧩 codeSnippet:", codeSnippet);
-      } else {
-        const fallback = await extractErrorContextFromStack(msg.text());
-        codeSnippet = fallback?.snippet;
-        console.log("🧩🧩 codeSnippet:", codeSnippet);
-      }
-
-
-
-      logCollector.push({
-        type: `console-${logType}`,
-        message: msg.text(),
-        timestamp: new Date().toISOString(),
-        url: page.url(),
-        ...(codeSnippet && { codeSnippet })
-      });
-    }
-  });
-
-  /*
-  pageerror 예시
-  Uncaught TypeError: Cannot read properties of null (reading 'classList')
-    at new MobileMenu (https://image.thehyundai.com/pc/js/cos/cos.custom.js?ver=040715:371:61)
-    at window.onload (https://image.thehyundai.com/pc/js/cos/cos.custom.js?ver=040715:434:10)
-  */
-  page.on("pageerror", async (err) => {
-    const message = err.message.toLowerCase();
-  
-    // 심각한 에러가 아닌 경우 무시 (선택)
-    //sif (!message.includes("uncaught") && !message.includes("is not defined")) return;
-  
-    console.log("🔥 PAGE ERROR STACK:\n", err.stack);
-  
-    // 🔍 스택에서 코드 위치 기반 코드 스니펫 추출
-    const context = await extractErrorContextFromStack(err.stack);
-  
-    const logData = {
-      type: "pageerror",
-      message: err.message,
-      timestamp: new Date().toISOString(),
-      pageUrl: page.url(),
-    };
-  
-    // context.snippet이 있으면 포함
-    if (context?.snippet) {
-      logData.codeSnippet = context.snippet;
-      logData.codeUrl = context.url;
-      logData.codeLine = context.line;
-    } else if (context?.error) {
-      logData.codeSnippet = context.error;
-    }
-  
-    // (선택) 스크린샷 캡처 비활성화 상태 유지
-    /*
-    const timestamp = Date.now();
-    const screenshotPath = `pageerror-screenshot-${timestamp}.png`;
-    await page.setViewport({ width: 1280, height: 720 });
-    await page.waitForSelector("body", { visible: true });
-    await page.screenshot({ path: screenshotPath });
-    logData.screenshot = screenshotPath;
-    */
-  
-    logCollector.push(logData);
-  });
-
-  
-
-  page.on("requestfailed", async (req) => {
-  try {
-    const failedUrl = req.url();
-    const hostname = new URL(failedUrl).hostname;
-    const excludedDomains = [
-      "analytics.google.com",
-      "www.google-analytics.com",
-      "cm.g.doubleclick.net"
-    ];
-
-    if (excludedDomains.includes(hostname)) return;
-
-    const timestamp = new Date().toISOString();
-
-    // (옵션) 스크린샷
-    /*
-    const screenshotPath = `requestfail-screenshot-${Date.now()}.png`;
-    await page.setViewport({ width: 1280, height: 720 });
-    await page.waitForSelector("body", { visible: true });
-    await page.screenshot({ path: screenshotPath });
-    */
-
-    logCollector.push({
-      type: "request-failed",
-      message: req.failure()?.errorText || "Unknown failure",
-      url: failedUrl,
-      timestamp,
-      pageUrl: page.url(),
-      // screenshot: screenshotPath
-    });
-  } catch (e) {
-    logCollector.push({
-      type: "request-failed",
-      message: req.failure()?.errorText || "Unknown failure",
-      url: req.url(),
-      timestamp: new Date().toISOString(),
-      pageUrl: page.url(),
-      note: "URL 파싱 실패, 필터 예외 처리됨"
-      // screenshot: screenshotPath
-    });
+  if (!brand) {
+    console.error("브랜드를 입력하세요. 예: --brand=cos");
+    process.exit(1);
   }
-});
-
-  // page.on("console", (msg) => {
-  //   const logType = msg.type(); // 'log', 'warning', 'error', 등
-  //   const message = msg.text().toLowerCase(); // 소문자로 변환해서 비교
-  //   if (
-  //     logType === "error" ||
-  //     (logType === "warning" && message.includes("deprecated"))
-  //   ) {
-  //     logCollector.push({
-  //       type: `console-${logType}`,
-  //       message: msg.text(),
-  //       timestamp: new Date().toISOString(),
-  //       url: page.url(),
-  //     });
-  //   }
-  // });
-
-
-  // page.on("pageerror", (err) =>
-  //   logCollector.push({
-  //     type: "pageerror",
-  //     message: err.message,
-  //     timestamp: new Date().toISOString(),
-  //     url: page.url(),
-  //   })
-  // );
-  // page.on("requestfailed", (req) => {
-  //   try {
-  //     const failedUrl = req.url();
-  //     const hostname = new URL(failedUrl).hostname;
-  //     const excludedDomains = ["analytics.google.com", "www.google-analytics.com"];
-  //     if (!excludedDomains.includes(hostname)) {
-  //       logCollector.push({
-  //         type: "request-failed",
-  //         message: req.failure().errorText,
-  //         url: failedUrl,
-  //         timestamp: new Date().toISOString(),
-  //         pageUrl: page.url(),
-  //       });
-  //     }
-  //   } catch (e) {
-  //     // URL 파싱 실패시에도 안전하게 로그 수집 (optional fallback)
-  //     logCollector.push({
-  //       type: "request-failed",
-  //       message: req.failure().errorText,
-  //       url: req.url(),
-  //       timestamp: new Date().toISOString(),
-  //       pageUrl: page.url(),
-  //       note: "URL 파싱 실패, 필터 예외 처리됨",
-  //     });
-  //   }
-  // });
-
 
   try {
-
-    await page.goto("https://stg.thehyundai.com/front/dpa/cosHome.thd", { waitUntil: "domcontentloaded" });
-
-    await page.waitForSelector("a.font_small_s_semibold[href*='cosItemList.thd?sectId=']");
-
-    const categoryUrls = await page.
-      $$eval("a.font_small_s_semibold[href*='cosItemList.thd?sectId=']", (els) =>
-        els.map((el) => el.href.startsWith("http") ? el.href : `https://stg.thehyundai.com${el.getAttribute("href")}`)
-      );
-
-    
-    // 검색창 열기
-    await page.waitForSelector("#open-search", { visible: true });
-    await page.click("#open-search");
-
-    // 추천 검색어 href 수집 (숫자로 시작하는 ID 이스케이프)
-    await page.waitForSelector("#\\35 -trend li a");
-    const hrefs = await page.$$eval("#\\35 -trend li a", els => els.map(el => el.getAttribute("href")));
-
-    const baseUrl = "https://stg.thehyundai.com";
-    if (hrefs.length >= 2) {
-      for (let i = 0; i < 2; i++) {
-        const searchUrl = hrefs[i].startsWith("http") ? hrefs[i] : `${baseUrl}${hrefs[i]}`;
-        console.log(`추천 검색어 ${i + 1}로 이동: ${searchUrl}`);
-        await page.goto(searchUrl, { waitUntil: "domcontentloaded" });
-        await new Promise(resolve => setTimeout(resolve, 1000));
-
-        // 다시 검색창 열기
-        await page.waitForSelector("#open-search", { visible: true });
-        await page.click("#open-search");
-        await page.waitForSelector("#\\35 -trend li a");
-      }
+    switch (brand.toLowerCase()) {
+      case "cos":
+        await runCosTest(page, browser);
+        break;
+      case "arket":
+        await runArketTest(page, browser);
+        break;
+      case "thehyundai":
+        await runThehyundaiTest(page, browser);
+        break;
+      case "otherstories":
+        await runOtherstoriesTest(page, browser);
+        break;
+      case "toteme":
+        await runTotemeTest(page, browser);
+        break;
+      case "nanushka":
+        await runNanushkaTest(page, browser);
+        break;
+      default:
+        console.error(`지원하지 않는 브랜드입니다: ${brand}`);
     }
 
-
-
-
-
-    // clothing 카테고리 페이지 전체방문
-    // clothing 카테고리 페이지 최대 2번만 방문
-    const maxVisits = 2;
-
-    for (let i = 0; i < Math.min(maxVisits, categoryUrls.length); i++) {
-      
-      const url = categoryUrls[i];
-      console.log(`이동: ${url}`);
-      await page.goto(url, { waitUntil: "domcontentloaded" });
-      await new Promise(resolve => setTimeout(resolve, 1000)); // 1초 대기
-    }
-
-    // clothing 카테고리 페이지에서 랜덤 상품 선택
-    await tryAddToCartFromCategory(page);
-
-    // 랜덤
-    // await page.waitForSelector("a.font_small_s_semibold[href*='cosItemList.thd?sectId=']");
-    // const clothingCategoryUrl = await page.$$eval("a.font_small_s_semibold[href*='cosItemList.thd?sectId=']", (els) => {
-    //   const hrefs = els.map((el) => el.href.startsWith("http") ? el.href : `https://www.thehyundai.com${el.getAttribute("href")}`);
-    //   return hrefs[Math.floor(Math.random() * hrefs.length)];
-    // });
-    // // await page.goto(clothingCategoryUrl, { waitUntil: "domcontentloaded" });
-
-
-    // for (const url of categoryUrls) {
-    //   console.log(`이동: ${url}`);
-    //   await page.goto(url, { waitUntil: "domcontentloaded" });
-    //   await new Promise((resolve) => setTimeout(resolve, 1000)); //대기
-    // }
-
-
-
-    
-    
-    await page.waitForSelector("#nav-bag-desktop");
-    await page.click("#nav-bag-desktop");
-
-
-    await page.waitForSelector(".btn-wrap a.btn");
-    await page.click(".btn-wrap a.btn");
-
-
-    // 로그인 팝업 제어
-    const pagesAfterPopup = await browser.pages();
-    const loginPage = pagesAfterPopup.find(p => p !== page);
-    if (!loginPage) throw new Error("로그인 팝업을 찾을 수 없습니다.");
-    await loginPage.bringToFront();
-
-
-    await loginPage.waitForSelector("#btn-go-thdLogin", { visible: true });
-    await loginPage.evaluate(() => document.getElementById("btn-go-thdLogin").click());
-    await loginPage.type("input[name='id']", "1234@gmail.com");
-    await loginPage.type("input[name='pwd']", "1234");
-    await loginPage.evaluate(() => memberLogin());
-    await new Promise(r => setTimeout(r, 5000));  // 로그인 대기
-
-
-    await page.bringToFront(); // 기존 주문 페이지로 복귀
-    await page.reload({ waitUntil: "domcontentloaded" });  // 로그인 상태 반영
-
-
-    await page.waitForSelector("#restPayRadio", { visible: true, timeout: 10000 });
-    await page.evaluate(() => {
-      document.querySelector("#restPayRadio").scrollIntoView({ behavior: "instant", block: "center" });
-    });
-
-
-    await page.click("#restPayRadio");
-
-
-    // 무통장입금 선택이 이미 되어 있다면 클릭 생략
-    const isCashChecked = await page.$eval("input[name='pay-depth1'][value='cash']", el => el.checked);
-    if (!isCashChecked) {
-      await page.click("input[name='pay-depth1'][value='cash']");
-    }
-
-
-    await page.waitForSelector("#ordAgreeChk");
-    await page.click("#ordAgreeChk");
-
-
-    await Promise.all([
-      page.waitForNavigation({ timeout: 60000, waitUntil: "networkidle2" }),
-      page.evaluate(() => {
-        const orderBtn = document.querySelector("a.btn.color2.size7");
-        if (orderBtn) orderBtn.click();  // onclick="order(this)" 트리거됨
-      }),
-    ]);
-
-    // 주문 내역 페이지로 이동
-    await page.goto("https://stg.thehyundai.com/front/mpa/selectOrdDlvCrst.thd", { waitUntil: "domcontentloaded" });
-    await page.waitForSelector("a.btn.size1.color7");
-    const cancelUrls = await page.$$eval("a.btn.size1.color7", els => els.map(el => el.href));
-    const latestCancelUrl = cancelUrls[0];
-
-
-    await page.goto(latestCancelUrl, { waitUntil: "domcontentloaded" });
-
-
-    // 수량 저장 클릭
-    await page.waitForFunction(() => typeof fnOrdCnclQtyChg === 'function');
-    await page.evaluate(() => fnOrdCnclQtyChg());
-
-
-    // 단순변심 선택
-    await page.select("select[name='cnslInqr']", "010105");
-
-
-    // 주문취소 버튼 클릭 전 팝업 처리기 등록
-    page.on("dialog", async (dialog) => {
-      console.log("알림 팝업 확인:", dialog.message());
-      await dialog.accept();
-    });
-
-
-    // 주문취소 버튼 클릭
-    await page.click("#btnOrdCnclReq");
-
-
-    // 로그아웃 수행
-    //await page.goto("https://www.thehyundai.com/front/member/logout.thd", { waitUntil: "domcontentloaded" });
     const savedLog = saveLogs();
     await analyzeWithAzureAI(savedLog);
   } catch (err) {
-    console.error("테스트 도중 오류 발생:", err.message);
+    console.error("테스트 중 에러 발생:", err.message);
     const savedLog = saveLogs();
     await analyzeWithAzureAI(savedLog);
   }
 
   await browser.close();
 })();
-
-
-

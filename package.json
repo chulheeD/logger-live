@@ -4,8 +4,9 @@
   "description": "CDP-based console and error logger for thehyundai.com",
   "main": "logger_filtered.js",
   "scripts": {
-    "start": "node logger_filtered.js"
-  },
+  "start": "node logger_filtered.js",
+  "logger_live": "node logger_live.js"
+},
   "dependencies": {
     "@azure-rest/ai-inference": "^1.0.0-beta.6",
     "@azure/core-auth": "^1.9.0",
