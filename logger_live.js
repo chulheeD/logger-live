@@ -596,6 +596,220 @@ async function runArketTest(page, browser) {
 
 async function runThehyundaiTest(page, browser) {
   console.log("더현대닷컴 사이트 테스트 시작");
+
+  await page.goto("https://www.thehyundai.com/Home.html", { waitUntil: "domcontentloaded" });
+
+
+  await visitThreeRandomHyundaiUrls(page);
+
+  async function visitThreeRandomHyundaiUrls(page) {
+    const gnbItems = await page.$$('.top-nav-area2 > ul > li');
+
+    for (const item of gnbItems) {
+      await item.hover();
+      await page.waitForTimeout(300); 
+    }
+
+    const allUrls = await page.$$eval('.in-cate-area a[href]', links =>
+      links.map(a => a.href).filter(href => href.includes('www.thehyundai.com'))
+    );
+
+    console.log('전체 추출된 www.thehyundai.com URL 수:', allUrls.length);
+
+    const selected = [];
+    while (selected.length < 3 && allUrls.length > 0) {
+      const randIdx = Math.floor(Math.random() * allUrls.length);
+      const randUrl = allUrls[randIdx];
+      if (!selected.includes(randUrl)) {
+        selected.push(randUrl);
+      }
+    }
+
+    for (let i = 0; i < selected.length; i++) {
+      const url = selected[i];
+      console.log(`🔹 [${i + 1}/3] 이동: ${url}`);
+      await page.goto(url, { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(2000); // 추가 대기
+    }
+    
+  }
+
+  await page.waitForSelector('#cs-token-input', { visible: true });
+  await page.click('#cs-token-input');
+
+  await page.waitForSelector('.popular-list li a', { visible: true });
+  const popularKeywords = await page.$$eval('.popular-list li a span', spans =>
+    spans.slice(0, 3).map(span => span.textContent.trim())
+  );
+
+  console.log(`수집된 인기 검색어: ${popularKeywords.join(', ')}`);
+
+  let addedToCart = false;
+
+  for (const keyword of popularKeywords) {
+    await page.click('#cs-token-input', { clickCount: 3 });
+    await page.keyboard.press('Backspace');
+    await page.type('#cs-token-input', keyword);
+
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+      page.click('#cs-search-input')
+    ]);
+
+    console.log(`'${keyword}' 검색 완료`);
+
+    // 상품 링크 수집
+    const productHrefs = await page.$$eval('.product-list.type1 li .img > a', as =>
+      as.map(a => a.getAttribute('href')).filter(href => href?.startsWith('/front/pda/itemPtc.thd'))
+    );
+
+    if (productHrefs.length === 0) {
+      console.log('검색 결과에 상품이 없습니다.');
+      continue;
+    }
+
+    const fullUrl = `https://www.thehyundai.com${productHrefs[0]}`;
+    console.log('상품 상세 페이지 이동:', fullUrl);
+    await page.goto(fullUrl, { waitUntil: 'domcontentloaded' });
+
+    try {
+      // 사이즈 드롭다운 열기 시도
+      await page.waitForSelector('.opt-select-value a', { visible: true, timeout: 3000 });
+      await page.click('.opt-select-value a');
+      console.log('사이즈 드롭다운 클릭');
+
+      // 선택 가능한 사이즈 확인
+      await page.waitForSelector('.opt-select-layer .depth-opt-list li[stckyn="Y"]', { visible: true, timeout: 3000 });
+
+      const sizeOptions = await page.$$eval('.opt-select-layer .depth-opt-list li[stckyn="Y"]', els =>
+        els.map(el => {
+          const name = el.querySelector('.opt-name')?.innerText.trim();
+          return {
+            label: name,
+            selector: `li[stckyn="Y"][totseq="${el.getAttribute('totseq')}"] a`
+          };
+        })
+      );
+
+      if (sizeOptions.length > 0) {
+        console.log(`선택 가능한 사이즈: ${sizeOptions.map(opt => opt.label).join(', ')}`);
+
+        await page.click(sizeOptions[0].selector);
+        console.log(`사이즈 '${sizeOptions[0].label}' 선택`);
+        await page.waitForTimeout(1000); // 추가 대기
+
+        // 팝업 처리 등록
+        page.on('dialog', async dialog => {
+          console.log(`팝업 감지됨: ${dialog.message()}`);
+          await dialog.accept();
+          console.log('팝업 확인 클릭 완료');
+        });
+
+        await page.click('button.btn.size6.color17');
+        console.log('장바구니 담기 버튼 클릭 완료');
+
+
+        await page.waitForTimeout(1500);
+
+
+        console.log('장바구니 페이지로 이동 완료');
+
+        break; // 성공했으면 종료
+      } else {
+        console.log('선택 가능한 사이즈 없음');
+      }
+
+    } catch (err) {
+      console.log('사이즈 선택 실패 또는 드롭다운 열기 실패');
+    }
+  }
+
+  if (!addedToCart) {
+    console.log('모든 검색어에서 구매 가능한 상품을 찾지 못했습니다.');
+  }
+
+  await page.waitForSelector(".btn-wrap a.btn");
+  await page.click(".btn-wrap a.btn");
+
+
+  // 로그인 팝업 제어
+  await page.waitForTimeout(1500);
+  const pagesAfterPopup = await browser.pages();
+  const loginPage = pagesAfterPopup.find(p => p !== page);
+  if (!loginPage) throw new Error("로그인 팝업을 찾을 수 없습니다.");
+  await loginPage.bringToFront();
+
+
+  await loginPage.waitForSelector("#btn-go-thdLogin", { visible: true });
+  await loginPage.evaluate(() => document.getElementById("btn-go-thdLogin").click());
+  // 더현대닷컴 계정 입력
+  await loginPage.type("input[name='id']", "1234@gmail.com");
+  await loginPage.type("input[name='pwd']", "1234");
+  await loginPage.evaluate(() => memberLogin());
+  await new Promise(r => setTimeout(r, 5000));  // 로그인 대기
+
+
+  await page.bringToFront(); // 기존 주문 페이지로 복귀
+  await page.reload({ waitUntil: "domcontentloaded" });  // 로그인 상태 반영
+
+
+  await page.waitForSelector("#restPayRadio", { visible: true, timeout: 10000 });
+  await page.evaluate(() => {
+    document.querySelector("#restPayRadio").scrollIntoView({ behavior: "instant", block: "center" });
+  });
+
+
+  await page.click("#restPayRadio");
+
+
+  // 무통장입금 선택이 이미 되어 있다면 클릭 생략
+  const isCashChecked = await page.$eval("input[name='pay-depth1'][value='cash']", el => el.checked);
+  if (!isCashChecked) {
+    await page.click("input[name='pay-depth1'][value='cash']");
+  }
+
+  await Promise.all([
+    page.waitForNavigation({ timeout: 60000, waitUntil: "networkidle2" }),
+    page.evaluate(() => {
+      const orderBtn = document.querySelector("a.btn.color2.size7");
+      if (orderBtn) orderBtn.click();  // onclick="order(this)" 트리거됨
+    }),
+  ]);
+
+  // 주문 내역 페이지로 이동
+  await page.goto("https://www.thehyundai.com/front/mpa/selectOrdDlvCrst.thd", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("a.btn.size1.color7");
+  const cancelUrls = await page.$$eval("a.btn.size1.color7", els => els.map(el => el.href));
+  const latestCancelUrl = cancelUrls[0];
+
+
+  await page.goto(latestCancelUrl, { waitUntil: "domcontentloaded" });
+
+
+  // 수량 저장 클릭
+  await page.waitForFunction(() => typeof fnOrdCnclQtyChg === 'function');
+  await page.evaluate(() => fnOrdCnclQtyChg());
+
+
+  // 단순변심 선택
+  await page.select("select[name='cnslInqr']", "010105");
+
+
+  // 주문취소 버튼 클릭 전 팝업 처리
+  page.on("dialog", async (dialog) => {
+    console.log("알림 팝업 확인:", dialog.message());
+    await dialog.accept();
+  });
+
+
+  // 주문취소 버튼 클릭
+  await page.click("#btnOrdCnclReq");
+
+
+  // 로그아웃 수행
+  await page.goto("https://www.thehyundai.com/front/member/logout.thd", { waitUntil: "domcontentloaded" });
+  
+  await browser.close();
 }
 
 async function runOtherstoriesTest(page, browser) {
